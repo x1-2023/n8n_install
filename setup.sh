@@ -8,6 +8,7 @@ set -e
 #   - Hỏi subdomain (nếu để trống => cài trên domain chính)
 #   - Người dùng paste chứng chỉ SSL (certificate.crt & private.key)
 #   - Script tạo file cấu hình Nginx, Docker Compose, ...
+# Đã tối ưu cho máy 2 core 4.5GB RAM
 ###############################################################################
 
 # Kiểm tra quyền root
@@ -48,9 +49,6 @@ read -p "Nhập POSTGRES_USER (ví dụ: n8n_zen_demo): " POSTGRES_USER
 read -p "Nhập POSTGRES_PASSWORD (ví dụ: n8n_pass_demo): " POSTGRES_PASSWORD
 read -p "Nhập POSTGRES_DB (ví dụ: n8n_db_demo): " POSTGRES_DB
 
-echo ""
-read -p "Nhập dung lượng swap (GB) cần tạo (ví dụ 2GB Ram thì nhập là 2): " swap_size
-
 ###############################################################################
 # Update hệ thống, cài đặt các gói cần thiết
 ###############################################################################
@@ -59,7 +57,7 @@ export DEBIAN_FRONTEND=noninteractive
 echo "===== Cập nhật hệ thống ====="
 apt update -y && apt upgrade -y
 
-echo "===== Cài đặt một số gói cơ bản (distro-info-data, cifs-utils, etc.) ====="
+echo "===== Cài đặt một số gói cơ bản ====="
 apt-get install -y distro-info-data cifs-utils mhddfs unionfs-fuse unzip zip \
                    software-properties-common wget curl gnupg2 ca-certificates lsb-release
 
@@ -84,7 +82,6 @@ gpg --dry-run --quiet --import --import-options import-show /etc/apt/trusted.gpg
 
 echo "deb http://nginx.org/packages/ubuntu $(lsb_release -cs) nginx" | tee /etc/apt/sources.list.d/nginx.list
 										  
-
 sudo apt update -y
 
 # Xóa Nginx cũ (nếu có)
@@ -105,15 +102,15 @@ if [ -f /etc/nginx/nginx.conf ]; then
   cp /etc/nginx/nginx.conf /etc/nginx/nginx.conf.bak
 fi
 
-# Ghi file /etc/nginx/nginx.conf
+# Ghi file /etc/nginx/nginx.conf - Đã tối ưu cho 2 core và RAM thấp
 cat > /etc/nginx/nginx.conf << 'EOL'
 user www-data;
-worker_processes auto;
+worker_processes 2;
 pid /run/nginx.pid;
 include /etc/nginx/modules-enabled/*.conf;
 
 events {
-	worker_connections 768;
+	worker_connections 512;
 	# multi_accept on;
 }
 
@@ -125,6 +122,7 @@ http {
 	tcp_nodelay on;
 	keepalive_timeout 65;
 	types_hash_max_size 2048;
+	server_tokens off;
 
 	include /etc/nginx/mime.types;
 	default_type application/octet-stream;
@@ -139,6 +137,16 @@ http {
 
 	## Gzip Settings
 	gzip on;
+	gzip_comp_level 4;
+	gzip_min_length 1000;
+	gzip_proxied any;
+	gzip_types text/plain text/css application/json application/javascript text/xml application/xml;
+
+	## Connection tuning
+	client_body_buffer_size 10K;
+	client_header_buffer_size 1k;
+	client_max_body_size 15G;
+	large_client_header_buffers 2 1k;
 
 	include /etc/nginx/conf.d/*.conf;
 	include /etc/nginx/sites-enabled/*;
@@ -168,7 +176,7 @@ sudo apt update -y
 sudo apt install -y ffmpeg
 
 ###############################################################################
-# Cấu hình domain cho Nginx, sử dụng file /etc/nginx/conf.d/<subdomain>.<domain>.conf
+# Cấu hình domain cho Nginx
 ###############################################################################
 CONF_FILE="/etc/nginx/conf.d/${HOSTNAME}.conf"
 cat > "$CONF_FILE" <<EOL
@@ -196,7 +204,7 @@ server {
     gzip on;
     gzip_vary on;
     gzip_proxied any;
-    gzip_comp_level 6;
+    gzip_comp_level 4;
     gzip_types text/plain text/css application/json application/javascript application/x-javascript text/xml application/xml application/xml+rss text/javascript;
 
     add_header Content-Security-Policy "frame-ancestors *";
@@ -218,8 +226,8 @@ server {
         proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
         proxy_set_header X-Forwarded-Proto \$scheme;
         proxy_set_header X-Frame-Options SAMEORIGIN;
-        proxy_buffers 16 64k;
-        proxy_buffer_size 128k;
+        proxy_buffers 8 32k;
+        proxy_buffer_size 64k;
         client_max_body_size 10M;
         proxy_set_header X-Forwarded-Server \$host;
 
@@ -229,8 +237,8 @@ server {
         proxy_send_timeout 900;
         proxy_read_timeout 900;
 
-        proxy_busy_buffers_size 256k;
-        proxy_temp_file_write_size 256k;
+        proxy_busy_buffers_size 128k;
+        proxy_temp_file_write_size 128k;
         proxy_intercept_errors on;
     }
 }
@@ -249,29 +257,6 @@ sudo systemctl restart nginx
 service nginx restart
 
 ###############################################################################
-# Tạo swap
-###############################################################################
-echo "===== Tạo/Thiết lập swap dung lượng ${swap_size}GB ====="
-
-if swapon --show | grep -q '/swapfile'; then
-    echo "Phân vùng swap đã tồn tại. Tiến hành hủy bỏ phân vùng cũ..."
-    swapoff /swapfile
-    rm -f /swapfile
-fi
-
-fallocate -l "${swap_size}G" /swapfile
-chmod 600 /swapfile
-mkswap /swapfile
-swapon /swapfile
-
-# Thêm vào /etc/fstab nếu chưa có									   
-if ! grep -q '/swapfile' /etc/fstab; then
-  echo '/swapfile none swap sw 0 0' >> /etc/fstab
-fi
-
-echo "Swap với dung lượng ${swap_size}GB đã được tạo và kích hoạt."
-
-###############################################################################
 # Cài đặt Redis
 ###############################################################################
 echo "===== Cài đặt Redis ====="
@@ -281,13 +266,15 @@ mkdir -p -m 600 /root/.gnupg
 gpg --dry-run --quiet --import --import-options import-show /etc/apt/trusted.gpg.d/redis.gpg
 
 echo "deb https://packages.redis.io/deb $(lsb_release -cs) main" | sudo tee /etc/apt/sources.list.d/redis.list
-# Nhiều khi script paste bị lặp, ta chỉ echo 1 dòng:
-# deb https://packages.redis.io/deb jammy main (tùy version Ubuntu). 
-# Ở đây ta tin dùng $(lsb_release -cs) = jammy.
 sudo apt update -y
 sudo apt install -y redis
 systemctl enable redis-server
 systemctl start redis-server
+
+# Tối ưu cấu hình Redis cho máy có RAM thấp
+sed -i 's/^# maxmemory .*/maxmemory 256mb/' /etc/redis/redis.conf
+sed -i 's/^# maxmemory-policy .*/maxmemory-policy allkeys-lru/' /etc/redis/redis.conf
+systemctl restart redis-server
 
 ###############################################################################
 # Cài đặt Docker & Docker Compose
@@ -296,25 +283,34 @@ echo "===== Cài đặt Docker & Docker Compose ====="
 sudo apt update -y
 sudo apt install -y apt-transport-https ca-certificates curl software-properties-common
 
-														 
 curl -fsSL https://download.docker.com/linux/ubuntu/gpg | sudo gpg --dearmor -o /usr/share/keyrings/docker-archive-keyring.gpg
 
 echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/docker-archive-keyring.gpg] https://download.docker.com/linux/ubuntu $(lsb_release -cs) stable" | sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
 																	 
-										  
 sudo apt update -y
-sudo apt install -y docker-ce docker-compose-plugin			   
+sudo apt install -y docker-ce docker-compose-plugin
 systemctl start docker
 systemctl enable docker
 sleep 5
+
+# Tối ưu cấu hình Docker cho máy có RAM thấp
+mkdir -p /etc/docker
+cat > /etc/docker/daemon.json <<EOL
+{
+  "log-driver": "json-file",
+  "log-opts": {
+    "max-size": "10m",
+    "max-file": "3"
+  }
+}
+EOL
+systemctl restart docker
 
 ###############################################################################
 # Mở các cổng firewall cần thiết
 ###############################################################################
 sudo ufw allow 5432
 sudo ufw allow 5678
-# sudo ufw allow 5456
-# sudo ufw allow 3456
 
 ###############################################################################
 # Tạo docker-compose.yml và file .env cho N8N
@@ -364,17 +360,12 @@ USER root
 
 # Cài ffmpeg (alpine) hoặc (debian-based). Tùy theo base image.
 # n8nio/n8n:latest hiện tại là alpine, nên:
-# RUN apk update && apk add ffmpeg
-
 RUN apk update && apk add --no-cache ffmpeg
-
-# nếu image của bạn dựa trên Debian/Ubuntu thì dùng lệnh sau thay thế cho lệnh trên
-# RUN apt-get update && apt-get install -y ffmpeg && rm -rf /var/lib/apt/lists/*
 
 USER node
 EOL
 
-# docker-compose.yml
+# docker-compose.yml - Đã tối ưu cho 2 core và 4.5GB RAM
 sudo tee "${INSTALL_DIR}/docker-compose.yml" > /dev/null <<EOL
 services:
   postgres:
@@ -389,6 +380,12 @@ services:
       - ./postgres_data:/var/lib/postgresql/data
     ports:
       - "5432:5432"
+    command: postgres -c shared_buffers=768MB -c work_mem=32MB -c maintenance_work_mem=128MB -c effective_cache_size=1GB -c random_page_cost=1.1
+    deploy:
+      resources:
+        limits:
+          memory: 1G
+          cpus: '0.7'
 
   n8n:
     build:
@@ -417,7 +414,7 @@ services:
       - N8N_BASIC_AUTH_ACTIVE=true
       - N8N_BASIC_AUTH_USER=\${N8N_BASIC_AUTH_USER}
       - N8N_BASIC_AUTH_PASSWORD=\${N8N_BASIC_AUTH_PASSWORD}
-
+      - NODE_OPTIONS="--max-old-space-size=1536"
     volumes:
       - ./n8n_data:/home/node/.n8n
       - ./n8n_data/files:/files
@@ -427,11 +424,15 @@ services:
     depends_on:
       - postgres
     user: "1000:1000"
+    deploy:
+      resources:
+        limits:
+          memory: 2G
+          cpus: '1.0'
 EOL
 
 echo "===== Khởi động lại Docker Compose để áp dụng quyền và cấu hình mới ====="
 cd "$INSTALL_DIR"
-						   
 
 sudo docker compose pull
 
@@ -443,6 +444,21 @@ sudo chown -R 1000:1000 "$INSTALL_DIR"/*
 
 # Khởi động lại docker compose ở chế độ detached
 sudo docker compose up -d
+
+# Tối ưu hiệu suất hệ thống
+echo "===== Tối ưu hiệu suất hệ thống ====="
+
+# Giảm swappiness để hạn chế sử dụng swap
+echo 'vm.swappiness=10' | sudo tee -a /etc/sysctl.conf
+
+# Tối ưu cho hệ thống có RAM thấp
+echo 'vm.dirty_ratio = 10' | sudo tee -a /etc/sysctl.conf
+echo 'vm.dirty_background_ratio = 5' | sudo tee -a /etc/sysctl.conf
+sudo sysctl -p
+
+# Điều chỉnh Linux OOM Killer ưu tiên bảo vệ các tiến trình hệ thống quan trọng
+echo "* soft nproc 10000" | sudo tee -a /etc/security/limits.conf
+echo "* hard nproc 15000" | sudo tee -a /etc/security/limits.conf
 
 echo "===== Đã tạo xong file docker-compose.yml và .env ====="
 
@@ -458,8 +474,7 @@ echo "==========================================================================
 echo "Để nâng cấp N8N mỗi khi có update mới, chạy lần lượt 3 lệnh sau"
 echo "  cd ${INSTALL_DIR}"
 echo "  docker compose down"
-echo "  docker-compose build --pull"
-											   
-echo "  docker-compose up -d"
+echo "  docker compose build --pull"
+echo "  docker compose up -d"
 echo "============================================================================"
 exit 0
